@@ -6,7 +6,15 @@ const { acquireLock, releaseLock } = require('./lib/redisLock');
 const { mockCheckout } = require('./lib/mockShopify');
 
 const app = express();
-app.use(express.json());
+
+app.set('trust proxy', process.env.TRUST_PROXY === '1' || process.env.TRUST_PROXY === 'true');
+app.use(express.json({ limit: '64kb' }));
+
+app.use((req, res, next) => {
+  res.set('X-Content-Type-Options', 'nosniff');
+  res.set('X-Frame-Options', 'DENY');
+  next();
+});
 
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
 const PORT = Number(process.env.PORT) || 3000;
