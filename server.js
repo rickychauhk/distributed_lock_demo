@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const Redis = require('ioredis');
 const { randomUUID } = require('crypto');
-const { acquireLock, releaseLock } = require('./lib/redisLock');
+const { acquireLock, releaseLock, LOCK_PREFIX } = require('./lib/redisLock');
 const { mockCheckout } = require('./lib/mockShopify');
 
 const app = express();
@@ -61,6 +61,26 @@ function pushLog(level, message, detail = null) {
 
 const redis = new Redis(REDIS_URL);
 
+// Subscribe to key expiry so we can log when a lock is released by TTL (not by releaseLock).
+// Requires Redis notify-keyspace-events Ex; we try to set it below (fails on some managed Redis).
+const redisSub = new Redis(REDIS_URL);
+redisSub.on('error', (err) => console.error('Redis sub error:', err.message));
+redisSub.on('connect', () => {
+  (async () => {
+    try {
+      await redisSub.config('SET', 'notify-keyspace-events', 'Ex');
+    } catch (_) {}
+    const db = redisSub.options.db || 0;
+    await redisSub.subscribe(`__keyevent@${db}__:expired`);
+  })().catch((err) => console.error('Redis sub setup:', err.message));
+});
+redisSub.on('message', (channel, key) => {
+  if (key.startsWith(LOCK_PREFIX)) {
+    const skuId = key.slice(LOCK_PREFIX.length);
+    pushLog('release', 'Lock released by TTL expiry', { key, skuId, reason: 'TTL expired' });
+  }
+});
+
 app.use((req, res, next) => {
   const requestId = (req.get('x-request-id') || '').trim() || randomUUID();
   req.requestId = requestId;
@@ -115,14 +135,17 @@ app.post('/api/checkout', async (req, res) => {
   const seq = requestSeq;
   const lockValue = `${userId}-${Date.now()}`;
   const idempotencyKey = (req.get('idempotency-key') || req.body?.idempotencyKey || '').trim();
+  const retryCount = parseInt(req.get('x-retry-count'), 10) || 0;
 
-  pushLog('info', `[#${seq}] Request received: userId=${userId} attempting Redis lock`, {
+  const retryLabel = retryCount > 0 ? ` (retry attempt ${retryCount})` : '';
+  pushLog('info', `[#${seq}] Request received: userId=${userId} attempting Redis lock${retryLabel}`, {
     seq,
     requestId,
     skuId,
     userId,
     lockKey: `checkout:lock:${skuId}`,
     lockValue,
+    ...(retryCount ? { retryAttempt: retryCount } : {}),
     ...(idempotencyKey ? { idempotencyKey } : {}),
   });
 
@@ -165,12 +188,15 @@ app.post('/api/checkout', async (req, res) => {
   const acquired = await acquireLock(redis, skuId, lockValue, LOCK_TTL);
 
   if (!acquired) {
-    pushLog('lock_fail', `[#${seq}] Lock denied: userId=${userId} blocked (oversell prevented)`, {
+    const retryHint = retryCount > 0 ? '; client will retry after retryAfter' : '; client can retry after retryAfter';
+    pushLog('lock_fail', `[#${seq}] Lock denied: userId=${userId} blocked (oversell prevented)${retryHint}`, {
       seq,
       requestId,
       skuId,
       userId,
       result: 'SKU_LOCKED',
+      retryAfter: LOCK_TTL,
+      ...(retryCount ? { retryAttempt: retryCount } : {}),
       hint: 'Lock held by another request; skip backend call',
     });
     if (idempotencyKey) {
@@ -192,10 +218,18 @@ app.post('/api/checkout', async (req, res) => {
     ttl: LOCK_TTL,
   });
 
+  const simulateNoRelease = req.get('x-simulate-no-release') === '1' || req.body?.simulateNoRelease === true;
+  if (simulateNoRelease) {
+    pushLog('info', `[#${seq}] Demo: will not release lock so you can see "Lock released by TTL expiry" in ${LOCK_TTL}s`, { seq, skuId, userId });
+  }
+
   try {
     pushLog('info', `[#${seq}] Mock checkout start`, { seq, requestId, skuId, userId, mockShopifyUserId: userId });
     const result = await mockCheckout(skuId, userId);
-    const released = await releaseLock(redis, skuId, lockValue);
+    let released = false;
+    if (!simulateNoRelease) {
+      released = await releaseLock(redis, skuId, lockValue);
+    }
 
     pushLog('shopify', `[#${seq}] Mock checkout success: mockShopifyUserId=${result.userId} orderId=${result.orderId}`, {
       seq,
@@ -205,11 +239,15 @@ app.post('/api/checkout', async (req, res) => {
       orderId: result.orderId,
       note: 'Only one request can checkout; others are blocked with 409',
     });
-    pushLog(
-      released ? 'release' : 'warn',
-      `[#${seq}] Lock release ${released ? 'ok' : 'skipped (not owner)'}: checkout:lock:${skuId}`,
-      { seq, requestId, skuId, userId }
-    );
+    if (!simulateNoRelease) {
+      pushLog(
+        released ? 'release' : 'warn',
+        `[#${seq}] Lock release ${released ? 'ok' : 'skipped (not owner)'}: checkout:lock:${skuId}`,
+        { seq, requestId, skuId, userId }
+      );
+    } else {
+      pushLog('release', `[#${seq}] Lock not released (demo). Wait ${LOCK_TTL}s to see "Lock released by TTL expiry"`, { seq, skuId, userId, ttl: LOCK_TTL });
+    }
 
     if (idempotencyKey) {
       const cacheKey = idempotencyCacheKey({ skuId, userId, idempotencyKey });
@@ -228,12 +266,14 @@ app.post('/api/checkout', async (req, res) => {
 
     return res.json(result);
   } catch (err) {
-    const released = await releaseLock(redis, skuId, lockValue);
-    pushLog(
-      released ? 'release' : 'warn',
-      `[#${seq}] Checkout failed; lock release ${released ? 'ok' : 'skipped (not owner)'}`,
-      { seq, requestId, skuId, userId, error: err.message }
-    );
+    if (!simulateNoRelease) {
+      const released = await releaseLock(redis, skuId, lockValue);
+      pushLog(
+        released ? 'release' : 'warn',
+        `[#${seq}] Checkout failed; lock release ${released ? 'ok' : 'skipped (not owner)'}`,
+        { seq, requestId, skuId, userId, error: err.message }
+      );
+    }
     if (idempotencyKey) {
       await redis.del(idempotencyInFlightKey({ skuId, userId, idempotencyKey }));
     }
@@ -301,7 +341,9 @@ function getDemoHtml() {
   <p class="sub">Every mock user request attempts a Redis lock. Only <strong>one userId</strong> acquires the lock and enters mock checkout; all others are blocked with HTTP 409. The log shows the winning <strong>mockShopifyUserId</strong> and <strong>orderId</strong>.</p>
   <div class="controls">
     <button class="primary" onclick="sendOne()">Send 1 checkout request</button>
+    <button onclick="sendOneNoRelease()">Send 1 (no release)see &quot;Lock released by TTL expiry&quot; after TTL</button>
     <button onclick="sendConcurrent(5)">Send 5 concurrent (only 1 wins the lock)</button>
+    <button onclick="sendConcurrentWithRetry(5)">Send 5 with retry (blocked users retry every 2s)</button>
     <button onclick="clearLog()">Clear log view</button>
   </div>
   <div id="log"></div>
@@ -378,6 +420,16 @@ function getDemoHtml() {
       } catch (e) { statusEl.textContent = 'Request failed: ' + e.message; }
     }
 
+    async function sendOneNoRelease() {
+      await resetAndResume();
+      statusEl.textContent = 'Sending (no release) — wait for TTL to see expiry log...';
+      try {
+        const r = await fetch('/api/checkout', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Simulate-No-Release': '1' }, body: JSON.stringify({ skuId: 'SKU-001', userId: 'demo-' + crypto.randomUUID() }) });
+        const j = await r.json();
+        statusEl.textContent = r.ok ? 'OK (lock not released). After TTL you will see "Lock released by TTL expiry"' : 'BLOCKED: ' + (j.code || r.status);
+      } catch (e) { statusEl.textContent = 'Request failed: ' + e.message; }
+    }
+
     async function sendConcurrent(n) {
       await resetAndResume();
       statusEl.textContent = 'Sending ' + n + ' concurrently...';
@@ -392,14 +444,47 @@ function getDemoHtml() {
       const blocked = results.filter(x => x.code === 'SKU_LOCKED').length;
       statusEl.textContent = 'OK: ' + ok + ' | BLOCKED(409): ' + blocked + ' (see logs above)';
     }
+
+    async function sendConcurrentWithRetry(n) {
+      await resetAndResume();
+      const RETRY_INTERVAL_MS = 2000;
+      const MAX_RETRIES = 5;
+      const ids = Array.from({ length: n }, () => 'user-' + crypto.randomUUID());
+      statusEl.textContent = 'Sending ' + n + ' with retry (blocked users retry every ' + (RETRY_INTERVAL_MS / 1000) + 's)...';
+
+      async function oneUserWithRetry(userId) {
+        for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+          const headers = { 'Content-Type': 'application/json' };
+          if (attempt > 0) headers['X-Retry-Count'] = String(attempt);
+          const r = await fetch('/api/checkout', { method: 'POST', headers, body: JSON.stringify({ skuId: 'SKU-001', userId }) });
+          const j = await r.json().catch(() => ({}));
+          if (r.status === 200) return { userId, status: 200, attempts: attempt + 1, orderId: j.orderId };
+          if (j.code !== 'SKU_LOCKED') return { userId, status: r.status, attempts: attempt + 1 };
+          if (attempt < MAX_RETRIES) await new Promise(x => setTimeout(x, RETRY_INTERVAL_MS));
+        }
+        return { userId, status: 409, attempts: MAX_RETRIES + 1 };
+      }
+
+      const results = await Promise.all(ids.map((id) => oneUserWithRetry(id)));
+      const ok = results.filter((r) => r.status === 200);
+      const blocked = results.filter((r) => r.status === 409);
+      statusEl.textContent = 'OK: ' + ok.length + ' (retries: ' + ok.map((r) => r.attempts).join(',') + ') | BLOCKED after max retries: ' + blocked.length;
+    }
   </script>
 </body>
 </html>`;
 }
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   pushLog('info', `API started on http://localhost:${PORT}`, { port: PORT });
   console.log(`API: http://localhost:${PORT}`);
   console.log('  POST /api/checkout  { "skuId", "userId" }');
   console.log('  GET  /health   GET  /api/logs   GET  /demo');
+});
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`Port ${PORT} in use. Stop the other process or run: PORT=3001 npm start`);
+    process.exit(1);
+  }
+  throw err;
 });
