@@ -23,7 +23,7 @@ npm install
 npm start
 http://localhost:3000/demo
 ```
-### Go to  http://localhost:3000/demo after API started 
+### Go to http://localhost:3000/demo after API started.
 
 ### 3. Simulate users racing for the same SKU
 
