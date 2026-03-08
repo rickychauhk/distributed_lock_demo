@@ -1,9 +1,3 @@
-/**
- * AWS Lambda handler: checkout with Redis lock (same logic as server.js).
- * Set Handler to: lambda/checkout.handler
- * Env: REDIS_URL (e.g. redis://your-elasticache.amazonaws.com:6379), LOCK_TTL, IDEMPOTENCY_TTL
- */
-
 const { randomUUID } = require('crypto');
 const Redis = require('ioredis');
 const { acquireLock, releaseLock } = require('../lib/redisLock');
