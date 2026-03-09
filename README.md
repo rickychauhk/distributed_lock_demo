@@ -8,15 +8,15 @@ Use a **Redis distributed lock** to prevent oversell: for the same SKU, only one
 
 | Approach | Pros | Cons |
 |----------|------|------|
-| **Redis SET NX EX** | Fast, low latency; no DB load; scales across instances; built-in TTL avoids deadlock | Requires Redis; not transactional with DB |
-| **DB row lock** (SELECT ... FOR UPDATE) | Single source of truth; transactional | DB bottleneck; higher latency; lock scope tied to DB connection |
+| **Redis SET NX EX** | Fast, low latency, no DB load, scales across instances, built-in TTL avoids deadlock | Requires Redis, not transactional with DB |
+| **DB row lock** (SELECT ... FOR UPDATE) | Single source of truth; transactional | DB bottleneck; higher latency, lock scope tied to DB connection |
 
-We choose Redis because checkout is an API-layer concern: we want to **block before calling Shopify**, not inside a DB transaction. Redis gives sub-millisecond lock/unlock, and TTL ensures the lock is released even if the process crashes.
+Choose Redis because checkout is an API-layer concern: we want to **block before calling Shopify**, not inside a DB transaction. Redis gives sub-millisecond lock/unlock, and TTL ensures the lock is released even if the process crashes.
 
 ### Why TTL 10 seconds
 
-- Mock checkout latency is ~200–500ms; 10s is a safe upper bound for real checkout (API call + payment).
-- Shorter TTL (e.g. 5s) risks releasing the lock before a slow checkout finishes; longer TTL (e.g. 30s) delays retries if the process crashes.
+- Mock checkout latency is ~200–500ms, 10s is a safe upper bound for real checkout (API call + payment).
+- Shorter TTL (e.g. 5s) risks releasing the lock before a slow checkout finishes, longer TTL (e.g. 30s) delays retries if the process crashes.
 - Tuning: set `LOCK_TTL` in `.env`; 10s is a reasonable default.
 
 ### Owner-safe release
@@ -38,9 +38,8 @@ We choose Redis because checkout is an API-layer concern: we want to **block bef
 # Docker
 docker run -d -p 6379:6379 --name redis-demo redis
 
-# Or local (macOS)
 brew install redis && brew services start redis
-# Or run directly
+# run directly
 redis-server
 ```
 
