@@ -9,7 +9,7 @@ Use a Redis distributed lock to prevent oversell: for the same SKU, only one req
 | Approach | Pros | Cons |
 |----------|------|------|
 | **Redis SET NX EX** | Fast, low latency, no DB load, scales across instances, built-in TTL avoids deadlock | Requires Redis, not transactional with DB |
-| **DB row lock** (SELECT ... FOR UPDATE) | Single source of truth; transactional | DB bottleneck; higher latency, lock scope tied to DB connection |
+| **DB row lock** (SELECT ... FOR UPDATE) | Single source of truth; transactional | DB bottleneck, higher latency, lock scope tied to DB connection |
 
 Choose Redis because checkout is an API-layer concern: want to block before calling Shopify, not inside a DB transaction. Redis gives sub-millisecond lock/unlock, and TTL ensures the lock is released even if the process crashes.
 
