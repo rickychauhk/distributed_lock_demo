@@ -2,8 +2,10 @@ require('dotenv').config();
 const express = require('express');
 const Redis = require('ioredis');
 const { randomUUID } = require('crypto');
-const { acquireLock, releaseLock, LOCK_PREFIX } = require('./lib/redisLock');
-const { mockCheckout } = require('./lib/mockShopify');
+const { LOCK_PREFIX } = require('./lib/redisLock');
+const { execute: checkoutExecute } = require('./lib/checkoutService');
+const mockShopifyAdapter = require('./lib/adapters/mockShopifyAdapter');
+const metrics = require('./lib/metrics');
 
 const app = express();
 
@@ -18,7 +20,7 @@ app.use((req, res, next) => {
 
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
 const PORT = Number(process.env.PORT) || 3000;
-const LOCK_TTL = Number(process.env.LOCK_TTL) || 30;
+const LOCK_TTL = Number(process.env.LOCK_TTL) || 10;
 const IDEMPOTENCY_TTL = Number(process.env.IDEMPOTENCY_TTL) || 300;
 
 const LOG_MAX = 500;
@@ -88,14 +90,6 @@ app.use((req, res, next) => {
   next();
 });
 
-function idempotencyCacheKey({ skuId, userId, idempotencyKey }) {
-  return `checkout:idemp:${skuId}:${userId}:${idempotencyKey}`;
-}
-
-function idempotencyInFlightKey({ skuId, userId, idempotencyKey }) {
-  return `checkout:idemp:inflight:${skuId}:${userId}:${idempotencyKey}`;
-}
-
 app.get('/', (req, res) => {
   res.type('application/json').json({
     name: 'Distributed Lock Demo API',
@@ -103,6 +97,7 @@ app.get('/', (req, res) => {
     endpoints: {
       'POST /api/checkout': 'Body: { "skuId", "userId" } (lock protected)',
       'GET /health': 'Health check (includes Redis ping)',
+      'GET /api/metrics': 'Checkout success/locked/failed counts, avg lock hold ms',
       'GET /api/logs': 'Recent logs (lock acquire/release + mock checkout)',
       'DELETE /api/logs': 'Clear all logs (demo utility)',
       'GET /demo': 'Live log viewer + fire concurrent requests',
@@ -123,21 +118,15 @@ redis.on('connect', () => {
 app.post('/api/checkout', async (req, res) => {
   const requestId = req.requestId;
   const { skuId, userId } = req.body || {};
-  if (!skuId || !userId) {
-    pushLog('warn', 'Missing skuId or userId', { requestId, body: req.body });
-    return res.status(400).json({
-      code: 'BAD_REQUEST',
-      message: 'skuId and userId are required',
-    });
-  }
+  const idempotencyKey = (req.get('idempotency-key') || req.body?.idempotencyKey || '').trim();
+  const retryCount = parseInt(req.get('x-retry-count'), 10) || 0;
+  const simulateNoRelease = req.get('x-simulate-no-release') === '1' || req.body?.simulateNoRelease === true;
 
   requestSeq += 1;
   const seq = requestSeq;
-  const lockValue = `${userId}-${Date.now()}`;
-  const idempotencyKey = (req.get('idempotency-key') || req.body?.idempotencyKey || '').trim();
-  const retryCount = parseInt(req.get('x-retry-count'), 10) || 0;
-
   const retryLabel = retryCount > 0 ? ` (retry attempt ${retryCount})` : '';
+  const lockValue = `${userId}-${Date.now()}`;
+
   pushLog('info', `[#${seq}] Request received: userId=${userId} attempting Redis lock${retryLabel}`, {
     seq,
     requestId,
@@ -149,26 +138,35 @@ app.post('/api/checkout', async (req, res) => {
     ...(idempotencyKey ? { idempotencyKey } : {}),
   });
 
-  if (idempotencyKey) {
-    const cacheKey = idempotencyCacheKey({ skuId, userId, idempotencyKey });
-    const cached = await redis.get(cacheKey);
-    if (cached) {
-      const parsed = JSON.parse(cached);
-      pushLog('info', `[#${seq}] Idempotency replay`, {
-        seq,
-        requestId,
-        skuId,
-        userId,
-        idempotencyKey,
-        orderId: parsed?.orderId,
-      });
-      res.set('x-idempotent-replay', '1');
-      return res.json(parsed);
-    }
+  const result = await checkoutExecute({
+    redis,
+    adapter: mockShopifyAdapter,
+    lockTTL: LOCK_TTL,
+    idempotencyTTL: IDEMPOTENCY_TTL,
+    skuId,
+    userId,
+    idempotencyKey,
+    requestId,
+    simulateNoRelease,
+    onMetrics: {
+      incrementSuccess: () => metrics.incrementSuccess(),
+      incrementLocked: () => metrics.incrementLocked(),
+      incrementFailed: () => metrics.incrementFailed(),
+      recordLockHoldMs: (ms) => metrics.recordLockHoldMs(ms),
+    },
+  });
 
-    const inFlightKey = idempotencyInFlightKey({ skuId, userId, idempotencyKey });
-    const inFlight = await redis.set(inFlightKey, requestId, 'EX', 60, 'NX');
-    if (inFlight !== 'OK') {
+  Object.entries(result.headers || {}).forEach(([k, v]) => res.set(k, v));
+  res.set('x-request-id', requestId);
+
+  switch (result.outcome) {
+    case 'bad_request':
+      pushLog('warn', 'Missing skuId or userId', { requestId, body: req.body });
+      return res.status(result.statusCode).json(result.body);
+    case 'idempotent_replay':
+      pushLog('info', `[#${seq}] Idempotency replay`, { seq, requestId, skuId, userId, idempotencyKey, orderId: result.body?.orderId });
+      return res.status(result.statusCode).json(result.body);
+    case 'idempotent_inflight':
       pushLog('lock_fail', `[#${seq}] Idempotency in-flight: blocked duplicate request`, {
         seq,
         requestId,
@@ -177,111 +175,66 @@ app.post('/api/checkout', async (req, res) => {
         idempotencyKey,
         hint: 'Another request with the same idempotency key is in progress',
       });
-      res.set('retry-after', '1');
-      return res.status(409).json({
-        code: 'IDEMPOTENCY_IN_PROGRESS',
-        message: 'Duplicate request in progress. Retry shortly.',
-      });
-    }
-  }
-
-  const acquired = await acquireLock(redis, skuId, lockValue, LOCK_TTL);
-
-  if (!acquired) {
-    const retryHint = retryCount > 0 ? '; client will retry after retryAfter' : '; client can retry after retryAfter';
-    pushLog('lock_fail', `[#${seq}] Lock denied: userId=${userId} blocked (oversell prevented)${retryHint}`, {
-      seq,
-      requestId,
-      skuId,
-      userId,
-      result: 'SKU_LOCKED',
-      retryAfter: LOCK_TTL,
-      ...(retryCount ? { retryAttempt: retryCount } : {}),
-      hint: 'Lock held by another request; skip backend call',
-    });
-    if (idempotencyKey) {
-      await redis.del(idempotencyInFlightKey({ skuId, userId, idempotencyKey }));
-    }
-    return res.status(409).json({
-      code: 'SKU_LOCKED',
-      message: 'This SKU is being checked out by another user. Please retry shortly.',
-      retryAfter: LOCK_TTL,
-    });
-  }
-
-  pushLog('lock_ok', `[#${seq}] Lock acquired: userId=${userId} entering mock checkout (only winner hits backend)`, {
-    seq,
-    requestId,
-    skuId,
-    userId,
-    mockShopifyUserId: userId,
-    ttl: LOCK_TTL,
-  });
-
-  const simulateNoRelease = req.get('x-simulate-no-release') === '1' || req.body?.simulateNoRelease === true;
-  if (simulateNoRelease) {
-    pushLog('info', `[#${seq}] Demo: will not release lock so you can see "Lock released by TTL expiry" in ${LOCK_TTL}s`, { seq, skuId, userId });
-  }
-
-  try {
-    pushLog('info', `[#${seq}] Mock checkout start`, { seq, requestId, skuId, userId, mockShopifyUserId: userId });
-    const result = await mockCheckout(skuId, userId);
-    let released = false;
-    if (!simulateNoRelease) {
-      released = await releaseLock(redis, skuId, lockValue);
-    }
-
-    pushLog('shopify', `[#${seq}] Mock checkout success: mockShopifyUserId=${result.userId} orderId=${result.orderId}`, {
-      seq,
-      requestId,
-      skuId,
-      mockShopifyUserId: result.userId,
-      orderId: result.orderId,
-      note: 'Only one request can checkout; others are blocked with 409',
-    });
-    if (!simulateNoRelease) {
-      pushLog(
-        released ? 'release' : 'warn',
-        `[#${seq}] Lock release ${released ? 'ok' : 'skipped (not owner)'}: checkout:lock:${skuId}`,
-        { seq, requestId, skuId, userId }
-      );
-    } else {
-      pushLog('release', `[#${seq}] Lock not released (demo). Wait ${LOCK_TTL}s to see "Lock released by TTL expiry"`, { seq, skuId, userId, ttl: LOCK_TTL });
-    }
-
-    if (idempotencyKey) {
-      const cacheKey = idempotencyCacheKey({ skuId, userId, idempotencyKey });
-      await redis.set(cacheKey, JSON.stringify(result), 'EX', IDEMPOTENCY_TTL);
-      await redis.del(idempotencyInFlightKey({ skuId, userId, idempotencyKey }));
-      pushLog('info', `[#${seq}] Idempotency stored`, {
+      return res.status(result.statusCode).json(result.body);
+    case 'locked': {
+      const retryHint = retryCount > 0 ? '; client will retry after retryAfter' : '; client can retry after retryAfter';
+      pushLog('lock_fail', `[#${seq}] Lock denied: userId=${userId} blocked (oversell prevented)${retryHint}`, {
         seq,
         requestId,
         skuId,
         userId,
-        idempotencyKey,
-        ttlSeconds: IDEMPOTENCY_TTL,
-        orderId: result.orderId,
+        result: 'SKU_LOCKED',
+        retryAfter: LOCK_TTL,
+        ...(retryCount ? { retryAttempt: retryCount } : {}),
+        hint: 'Lock held by another request; skip backend call',
       });
+      return res.status(result.statusCode).json(result.body);
     }
-
-    return res.json(result);
-  } catch (err) {
-    if (!simulateNoRelease) {
-      const released = await releaseLock(redis, skuId, lockValue);
-      pushLog(
-        released ? 'release' : 'warn',
-        `[#${seq}] Checkout failed; lock release ${released ? 'ok' : 'skipped (not owner)'}`,
-        { seq, requestId, skuId, userId, error: err.message }
-      );
+    case 'success': {
+      pushLog('lock_ok', `[#${seq}] Lock acquired: userId=${userId} entering mock checkout (only winner hits backend)`, {
+        seq,
+        requestId,
+        skuId,
+        userId,
+        mockShopifyUserId: userId,
+        ttl: LOCK_TTL,
+      });
+      if (simulateNoRelease) {
+        pushLog('info', `[#${seq}] Demo: will not release lock so you can see "Lock released by TTL expiry" in ${LOCK_TTL}s`, { seq, skuId, userId });
+      }
+      pushLog('info', `[#${seq}] Mock checkout start`, { seq, requestId, skuId, userId });
+      pushLog('shopify', `[#${seq}] Mock checkout success: mockShopifyUserId=${result.body.userId} orderId=${result.body.orderId}`, {
+        seq,
+        requestId,
+        skuId,
+        mockShopifyUserId: result.body.userId,
+        orderId: result.body.orderId,
+        note: 'Only one request can checkout; others are blocked with 409',
+      });
+      if (simulateNoRelease) {
+        pushLog('release', `[#${seq}] Lock not released (demo). Wait ${LOCK_TTL}s to see "Lock released by TTL expiry"`, { seq, skuId, userId, ttl: LOCK_TTL });
+      } else {
+        pushLog('release', `[#${seq}] Lock release ok: checkout:lock:${skuId}`, { seq, requestId, skuId, userId });
+      }
+      if (idempotencyKey) {
+        pushLog('info', `[#${seq}] Idempotency stored`, {
+          seq,
+          requestId,
+          skuId,
+          userId,
+          idempotencyKey,
+          ttlSeconds: IDEMPOTENCY_TTL,
+          orderId: result.body.orderId,
+        });
+      }
+      return res.status(result.statusCode).json(result.body);
     }
-    if (idempotencyKey) {
-      await redis.del(idempotencyInFlightKey({ skuId, userId, idempotencyKey }));
-    }
-    console.error('Checkout error:', err);
-    return res.status(502).json({
-      code: 'CHECKOUT_FAILED',
-      message: err.message || 'Checkout failed',
-    });
+    case 'checkout_failed':
+      console.error('Checkout error:', result.body.message);
+      pushLog('release', `[#${seq}] Checkout failed; lock released`, { seq, requestId, skuId, userId, error: result.body.message });
+      return res.status(result.statusCode).json(result.body);
+    default:
+      return res.status(500).json({ code: 'INTERNAL_ERROR', message: 'Unknown outcome' });
   }
 });
 
@@ -292,6 +245,10 @@ app.get('/health', async (req, res) => {
   } catch (e) {
     res.status(503).json({ ok: false, redis: e.message });
   }
+});
+
+app.get('/api/metrics', (req, res) => {
+  res.type('application/json').json(metrics.get());
 });
 
 app.get('/api/logs', (req, res) => {
@@ -341,7 +298,7 @@ function getDemoHtml() {
   <p class="sub">Every mock user request attempts a Redis lock. Only <strong>one userId</strong> acquires the lock and enters mock checkout; all others are blocked with HTTP 409. The log shows the winning <strong>mockShopifyUserId</strong> and <strong>orderId</strong>.</p>
   <div class="controls">
     <button class="primary" onclick="sendOne()">Send 1 checkout request</button>
-    <button onclick="sendOneNoRelease()">Send 1 (no release)see &quot;Lock released by TTL expiry&quot; after TTL</button>
+    <button onclick="sendOneNoRelease()">Send 1 (no release) see &quot;Lock released by TTL expiry&quot; after TTL</button>
     <button onclick="sendConcurrent(5)">Send 5 concurrent (only 1 wins the lock)</button>
     <button onclick="sendConcurrentWithRetry(5)">Send 5 with retry (blocked users retry every 2s)</button>
     <button onclick="clearLog()">Clear log view</button>
@@ -479,7 +436,7 @@ const server = app.listen(PORT, () => {
   pushLog('info', `API started on http://localhost:${PORT}`, { port: PORT });
   console.log(`API: http://localhost:${PORT}`);
   console.log('  POST /api/checkout  { "skuId", "userId" }');
-  console.log('  GET  /health   GET  /api/logs   GET  /demo');
+  console.log('  GET  /health   GET  /api/metrics   GET  /api/logs   GET  /demo');
 });
 server.on('error', (err) => {
   if (err.code === 'EADDRINUSE') {

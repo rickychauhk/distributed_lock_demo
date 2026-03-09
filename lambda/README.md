@@ -13,7 +13,7 @@ Same checkout + lock + idempotency logic as the Express server, for API Gateway 
 | Variable | Example | Description |
 |----------|---------|-------------|
 | `REDIS_URL` | `redis://your-elasticache.cache.amazonaws.com:6379` | **Required** in AWS. Use ElastiCache Redis endpoint. |
-| `LOCK_TTL` | `30` | Lock TTL in seconds. |
+| `LOCK_TTL` | `10` | Lock TTL in seconds. |
 | `IDEMPOTENCY_TTL` | `300` | Idempotency cache TTL in seconds. |
 
 For **ElastiCache with encryption in transit**, use `rediss://` and ensure the Lambda VPC can reach the cluster.

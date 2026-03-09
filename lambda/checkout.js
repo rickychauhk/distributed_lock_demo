@@ -1,9 +1,9 @@
 const { randomUUID } = require('crypto');
 const Redis = require('ioredis');
-const { acquireLock, releaseLock } = require('../lib/redisLock');
-const { mockCheckout } = require('../lib/mockShopify');
+const { execute: checkoutExecute } = require('../lib/checkoutService');
+const mockShopifyAdapter = require('../lib/adapters/mockShopifyAdapter');
 
-const LOCK_TTL = Number(process.env.LOCK_TTL) || 30;
+const LOCK_TTL = Number(process.env.LOCK_TTL) || 10;
 const IDEMPOTENCY_TTL = Number(process.env.IDEMPOTENCY_TTL) || 300;
 
 let redis;
@@ -22,14 +22,6 @@ function getRedis() {
   return redis;
 }
 
-function idempotencyCacheKey({ skuId, userId, idempotencyKey }) {
-  return `checkout:idemp:${skuId}:${userId}:${idempotencyKey}`;
-}
-
-function idempotencyInFlightKey({ skuId, userId, idempotencyKey }) {
-  return `checkout:idemp:inflight:${skuId}:${userId}:${idempotencyKey}`;
-}
-
 function apiResponse(statusCode, body, headers = {}) {
   return {
     statusCode,
@@ -44,71 +36,25 @@ function apiResponse(statusCode, body, headers = {}) {
 
 async function handleCheckout(body, requestId) {
   const { skuId, userId } = body || {};
-  if (!skuId || !userId) {
-    return apiResponse(400, {
-      code: 'BAD_REQUEST',
-      message: 'skuId and userId are required',
-    }, { 'x-request-id': requestId });
-  }
+  const idempotencyKey = (body?.idempotencyKey || '').trim();
 
-  const client = getRedis();
-  const lockValue = `${userId}-${Date.now()}`;
-  const idempotencyKey = (body.idempotencyKey || '').trim();
+  const result = await checkoutExecute({
+    redis: getRedis(),
+    adapter: mockShopifyAdapter,
+    lockTTL: LOCK_TTL,
+    idempotencyTTL: IDEMPOTENCY_TTL,
+    skuId,
+    userId,
+    idempotencyKey,
+    requestId,
+    simulateNoRelease: false,
+    onMetrics: {},
+  });
 
-  if (idempotencyKey) {
-    const cacheKey = idempotencyCacheKey({ skuId, userId, idempotencyKey });
-    const cached = await client.get(cacheKey);
-    if (cached) {
-      const parsed = JSON.parse(cached);
-      return apiResponse(200, parsed, {
-        'x-request-id': requestId,
-        'x-idempotent-replay': '1',
-      });
-    }
-    const inFlightKey = idempotencyInFlightKey({ skuId, userId, idempotencyKey });
-    const inFlight = await client.set(inFlightKey, requestId, 'EX', 60, 'NX');
-    if (inFlight !== 'OK') {
-      return apiResponse(409, {
-        code: 'IDEMPOTENCY_IN_PROGRESS',
-        message: 'Duplicate request in progress. Retry shortly.',
-      }, { 'x-request-id': requestId, 'retry-after': '1' });
-    }
-  }
-
-  const acquired = await acquireLock(client, skuId, lockValue, LOCK_TTL);
-  if (!acquired) {
-    if (idempotencyKey) {
-      await client.del(idempotencyInFlightKey({ skuId, userId, idempotencyKey }));
-    }
-    return apiResponse(409, {
-      code: 'SKU_LOCKED',
-      message: 'This SKU is being checked out by another user. Please retry shortly.',
-      retryAfter: LOCK_TTL,
-    }, { 'x-request-id': requestId });
-  }
-
-  try {
-    const result = await mockCheckout(skuId, userId);
-    await releaseLock(client, skuId, lockValue);
-
-    if (idempotencyKey) {
-      const cacheKey = idempotencyCacheKey({ skuId, userId, idempotencyKey });
-      await client.set(cacheKey, JSON.stringify(result), 'EX', IDEMPOTENCY_TTL);
-      await client.del(idempotencyInFlightKey({ skuId, userId, idempotencyKey }));
-    }
-
-    return apiResponse(200, result, { 'x-request-id': requestId });
-  } catch (err) {
-    await releaseLock(client, skuId, lockValue);
-    if (idempotencyKey) {
-      await client.del(idempotencyInFlightKey({ skuId, userId, idempotencyKey }));
-    }
-    console.error('Checkout error:', err);
-    return apiResponse(502, {
-      code: 'CHECKOUT_FAILED',
-      message: err.message || 'Checkout failed',
-    }, { 'x-request-id': requestId });
-  }
+  return apiResponse(result.statusCode, result.body, {
+    'x-request-id': requestId,
+    ...result.headers,
+  });
 }
 
 exports.handler = async (event) => {
