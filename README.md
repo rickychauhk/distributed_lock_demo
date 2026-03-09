@@ -1,6 +1,6 @@
 # Distributed Lock Demo
 
-Use a **Redis distributed lock** to prevent oversell: for the same SKU, only one request is allowed to enter checkout (mock Shopify). All other concurrent requests are blocked at the API layer with HTTP 409 (no backend call).
+Use a Redis distributed lock to prevent oversell: for the same SKU, only one request is allowed to enter checkout (mock Shopify). All other concurrent requests are blocked at the API layer with HTTP 409 (no backend call).
 
 ## Design decisions
 
@@ -11,7 +11,7 @@ Use a **Redis distributed lock** to prevent oversell: for the same SKU, only one
 | **Redis SET NX EX** | Fast, low latency, no DB load, scales across instances, built-in TTL avoids deadlock | Requires Redis, not transactional with DB |
 | **DB row lock** (SELECT ... FOR UPDATE) | Single source of truth; transactional | DB bottleneck; higher latency, lock scope tied to DB connection |
 
-Choose Redis because checkout is an API-layer concern: we want to **block before calling Shopify**, not inside a DB transaction. Redis gives sub-millisecond lock/unlock, and TTL ensures the lock is released even if the process crashes.
+Choose Redis because checkout is an API-layer concern: want to block before calling Shopify, not inside a DB transaction. Redis gives sub-millisecond lock/unlock, and TTL ensures the lock is released even if the process crashes.
 
 ### Why TTL 10 seconds
 
@@ -51,7 +51,7 @@ npm install
 npm start
 ```
 
-Go to http://localhost:3000/demo after API started.
+Go to Live log viewer http://localhost:3000/demo after API started.
 
 ### 3. Simulate users racing for the same SKU
 
